@@ -1,0 +1,938 @@
+# 顔認証ロック解除アプリ(face_auth_v4)
+# このファイル1つを .github/workflows/ に置いてpushすると、
+# プロジェクト一式を生成 → ビルド → APKをArtifactsに出します。
+name: Build FaceAuth APK
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+      - name: Android SDK
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-34" "build-tools;34.0.0" > /dev/null
+      - name: Generate project
+        run: |
+          set -e
+          mkdir -p "$(dirname 'app/build.gradle.kts')"
+          cat > 'app/build.gradle.kts' <<'__EOF__'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.yuduki.faceauth"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.yuduki.faceauth"
+                  minSdk = 26
+                  targetSdk = 33
+                  versionCode = 4
+                  versionName = "4.0"
+              }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+
+          dependencies {
+              implementation("androidx.core:core-ktx:1.13.1")
+              implementation("androidx.activity:activity-ktx:1.9.0")
+              implementation("androidx.camera:camera-camera2:1.3.4")
+              implementation("androidx.camera:camera-lifecycle:1.3.4")
+              implementation("androidx.camera:camera-view:1.3.4")
+              implementation("androidx.lifecycle:lifecycle-service:2.8.2")
+              implementation("com.google.mlkit:face-mesh-detection:16.0.0-beta3")
+          }
+          __EOF__
+          mkdir -p "$(dirname 'app/src/main/AndroidManifest.xml')"
+          cat > 'app/src/main/AndroidManifest.xml' <<'__EOF__'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.CAMERA" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <uses-feature android:name="android.hardware.camera" android:required="false" />
+
+              <application
+                  android:allowBackup="false"
+                  android:label="顔認証ロック解除"
+                  android:theme="@android:style/Theme.Material.Light.NoActionBar">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".FaceService"
+                      android:exported="false"
+                      android:foregroundServiceType="camera" />
+
+                  <service
+                      android:name=".UnlockService"
+                      android:exported="true"
+                      android:label="顔認証ロック解除"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.accessibilityservice.AccessibilityService" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.accessibilityservice"
+                          android:resource="@xml/accessibility_config" />
+                  </service>
+              </application>
+          </manifest>
+          __EOF__
+          mkdir -p "$(dirname 'app/src/main/java/com/yuduki/faceauth/FaceCore.kt')"
+          cat > 'app/src/main/java/com/yuduki/faceauth/FaceCore.kt' <<'__EOF__'
+          package com.yuduki.faceauth
+
+          import android.content.Context
+          import android.security.keystore.KeyGenParameterSpec
+          import android.security.keystore.KeyProperties
+          import android.util.Base64
+          import com.google.mlkit.vision.facemesh.FaceMesh
+          import java.security.KeyStore
+          import javax.crypto.Cipher
+          import javax.crypto.KeyGenerator
+          import javax.crypto.SecretKey
+          import javax.crypto.spec.GCMParameterSpec
+          import kotlin.math.atan2
+          import kotlin.math.cos
+          import kotlin.math.hypot
+          import kotlin.math.sin
+          import kotlin.math.sqrt
+
+          object FaceCore {
+              const val THRESHOLD = 0.10f   // 小さいほど厳しい
+              const val NEED_OK_FRAMES = 3
+
+              // 顔メッシュ468点を「鼻先を原点・目の間隔を1・目の線を水平」に正規化
+              fun signature(mesh: FaceMesh): FloatArray {
+                  val p = mesh.allPoints
+                  val nose = p[1].position
+                  val l = p[33].position
+                  val r = p[263].position
+                  val theta = -atan2(r.y - l.y, r.x - l.x)
+                  val c = cos(theta)
+                  val s = sin(theta)
+                  val scale = hypot(r.x - l.x, r.y - l.y)
+                  val out = FloatArray(p.size * 3)
+                  for (i in p.indices) {
+                      val q = p[i].position
+                      val dx = q.x - nose.x
+                      val dy = q.y - nose.y
+                      out[i * 3] = (dx * c - dy * s) / scale
+                      out[i * 3 + 1] = (dx * s + dy * c) / scale
+                      out[i * 3 + 2] = (q.z - nose.z) / scale
+                  }
+                  return out
+              }
+
+              fun dist(a: FloatArray, b: FloatArray): Float {
+                  val n = minOf(a.size, b.size) / 3
+                  var sum = 0f
+                  for (i in 0 until n) {
+                      val dx = a[i * 3] - b[i * 3]
+                      val dy = a[i * 3 + 1] - b[i * 3 + 1]
+                      val dz = a[i * 3 + 2] - b[i * 3 + 2]
+                      sum += sqrt(dx * dx + dy * dy + dz * dz)
+                  }
+                  return sum / n
+              }
+
+              fun average(list: List<FloatArray>): FloatArray {
+                  val out = FloatArray(list[0].size)
+                  for (a in list) for (i in out.indices) out[i] += a[i]
+                  val n = list.size.toFloat()
+                  for (i in out.indices) out[i] = out[i] / n
+                  return out
+              }
+          }
+
+          // PINと顔データはAndroid Keystoreの鍵で暗号化して保存
+          object Vault {
+              private const val ALIAS = "faceauth_key"
+
+              private fun key(): SecretKey {
+                  val ks = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
+                  (ks.getKey(ALIAS, null) as? SecretKey)?.let { return it }
+                  val kg = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, "AndroidKeyStore")
+                  kg.init(
+                      KeyGenParameterSpec.Builder(
+                          ALIAS, KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT
+                      )
+                          .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
+                          .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
+                          .setKeySize(256)
+                          .build()
+                  )
+                  return kg.generateKey()
+              }
+
+              fun enc(plain: String): String {
+                  val c = Cipher.getInstance("AES/GCM/NoPadding")
+                  c.init(Cipher.ENCRYPT_MODE, key())
+                  val ct = c.doFinal(plain.toByteArray())
+                  return Base64.encodeToString(c.iv, Base64.NO_WRAP) + ":" +
+                      Base64.encodeToString(ct, Base64.NO_WRAP)
+              }
+
+              fun dec(s: String): String {
+                  val parts = s.split(":")
+                  val iv = Base64.decode(parts[0], Base64.NO_WRAP)
+                  val ct = Base64.decode(parts[1], Base64.NO_WRAP)
+                  val c = Cipher.getInstance("AES/GCM/NoPadding")
+                  c.init(Cipher.DECRYPT_MODE, key(), GCMParameterSpec(128, iv))
+                  return String(c.doFinal(ct))
+              }
+          }
+
+          object Store {
+              private fun sp(c: Context) = c.getSharedPreferences("face2", Context.MODE_PRIVATE)
+
+              fun saveFace(c: Context, v: FloatArray) {
+                  sp(c).edit().putString("sig", Vault.enc(v.joinToString(","))).apply()
+              }
+
+              fun loadFace(c: Context): FloatArray? = try {
+                  sp(c).getString("sig", null)?.let { s ->
+                      Vault.dec(s).split(",").map { it.toFloat() }.toFloatArray()
+                  }
+              } catch (e: Exception) { null }
+
+              fun savePin(c: Context, pin: String) {
+                  sp(c).edit().putString("pin", Vault.enc(pin)).putString("mode", "pin").apply()
+              }
+
+              // パターンは点の番号(1〜9)を並べた文字列。例: 14789
+              fun savePattern(c: Context, p: String) {
+                  sp(c).edit().putString("pattern", Vault.enc(p)).putString("mode", "pattern").apply()
+              }
+
+              fun loadPattern(c: Context): String? = try {
+                  sp(c).getString("pattern", null)?.let { Vault.dec(it) }
+              } catch (e: Exception) { null }
+
+              fun getMode(c: Context): String = sp(c).getString("mode", "pin") ?: "pin"
+
+              fun loadSecret(c: Context): String? =
+                  if (getMode(c) == "pattern") loadPattern(c) else loadPin(c)
+
+              fun loadPin(c: Context): String? = try {
+                  sp(c).getString("pin", null)?.let { Vault.dec(it) }
+              } catch (e: Exception) { null }
+
+              fun hasPin(c: Context) = sp(c).contains("pin")
+
+              fun setEnter(c: Context, b: Boolean) { sp(c).edit().putBoolean("enter", b).apply() }
+              fun getEnter(c: Context) = sp(c).getBoolean("enter", false)
+          }
+          __EOF__
+          mkdir -p "$(dirname 'app/src/main/java/com/yuduki/faceauth/FaceService.kt')"
+          cat > 'app/src/main/java/com/yuduki/faceauth/FaceService.kt' <<'__EOF__'
+          package com.yuduki.faceauth
+
+          import android.app.KeyguardManager
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.content.BroadcastReceiver
+          import android.content.Context
+          import android.content.Intent
+          import android.content.IntentFilter
+          import android.content.pm.ServiceInfo
+          import android.os.Handler
+          import android.os.Looper
+          import androidx.camera.core.CameraSelector
+          import androidx.camera.core.ImageAnalysis
+          import androidx.camera.lifecycle.ProcessCameraProvider
+          import androidx.core.app.ServiceCompat
+          import androidx.core.content.ContextCompat
+          import androidx.lifecycle.LifecycleService
+          import com.google.mlkit.vision.common.InputImage
+          import com.google.mlkit.vision.facemesh.FaceMesh
+          import com.google.mlkit.vision.facemesh.FaceMeshDetection
+          import java.util.concurrent.Executors
+
+          // 画面ON(ロック中)になったらインカメで顔を探し、一致したら UnlockService に解除させる
+          class FaceService : LifecycleService() {
+
+              private val detector = FaceMeshDetection.getClient()
+              private val executor = Executors.newSingleThreadExecutor()
+              private val handler = Handler(Looper.getMainLooper())
+              private var provider: ProcessCameraProvider? = null
+              @Volatile private var active = false
+              private var okCount = 0
+              private var ref: FloatArray? = null
+
+              private val receiver = object : BroadcastReceiver() {
+                  override fun onReceive(context: Context, intent: Intent) {
+                      when (intent.action) {
+                          Intent.ACTION_SCREEN_ON -> startScan()
+                          Intent.ACTION_SCREEN_OFF, Intent.ACTION_USER_PRESENT -> stopScan()
+                      }
+                  }
+              }
+
+              override fun onCreate() {
+                  super.onCreate()
+                  val nm = getSystemService(NotificationManager::class.java)
+                  nm.createNotificationChannel(
+                      NotificationChannel("face", "顔認証", NotificationManager.IMPORTANCE_LOW)
+                  )
+                  val n = android.app.Notification.Builder(this, "face")
+                      .setContentTitle("顔認証ロック解除が有効です")
+                      .setSmallIcon(android.R.drawable.ic_menu_camera)
+                      .build()
+                  ServiceCompat.startForeground(this, 1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA)
+
+                  registerReceiver(receiver, IntentFilter().apply {
+                      addAction(Intent.ACTION_SCREEN_ON)
+                      addAction(Intent.ACTION_SCREEN_OFF)
+                      addAction(Intent.ACTION_USER_PRESENT)
+                  })
+              }
+
+              private fun startScan() {
+                  val km = getSystemService(KeyguardManager::class.java)
+                  if (active || !km.isKeyguardLocked) return
+                  ref = Store.loadFace(this) ?: return
+                  okCount = 0
+                  active = true
+
+                  val f = ProcessCameraProvider.getInstance(this)
+                  f.addListener({
+                      if (!active) return@addListener
+                      val p = f.get()
+                      provider = p
+                      val analysis = ImageAnalysis.Builder()
+                          .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                          .build()
+                      analysis.setAnalyzer(executor) { proxy ->
+                          val media = proxy.image
+                          if (media == null || !active) {
+                              proxy.close()
+                              return@setAnalyzer
+                          }
+                          detector.process(InputImage.fromMediaImage(media, proxy.imageInfo.rotationDegrees))
+                              .addOnSuccessListener { onMeshes(it) }
+                              .addOnCompleteListener { proxy.close() }
+                      }
+                      p.unbindAll()
+                      p.bindToLifecycle(this, CameraSelector.DEFAULT_FRONT_CAMERA, analysis)
+                  }, ContextCompat.getMainExecutor(this))
+
+                  // バッテリー節約: 20秒で諦める
+                  handler.postDelayed({ stopScan() }, 20_000)
+              }
+
+              private fun onMeshes(meshes: List<FaceMesh>) {
+                  if (!active) return
+                  val r = ref ?: return
+                  if (meshes.isEmpty()) {
+                      okCount = 0
+                      return
+                  }
+                  val d = FaceCore.dist(FaceCore.signature(meshes[0]), r)
+                  if (d < FaceCore.THRESHOLD) okCount++ else okCount = 0
+                  if (okCount >= FaceCore.NEED_OK_FRAMES) {
+                      stopScan()
+                      UnlockService.instance?.unlock(Store.getMode(this), Store.loadSecret(this), Store.getEnter(this))
+                  }
+              }
+
+              private fun stopScan() {
+                  active = false
+                  handler.removeCallbacksAndMessages(null)
+                  provider?.unbindAll()
+              }
+
+              override fun onDestroy() {
+                  stopScan()
+                  unregisterReceiver(receiver)
+                  detector.close()
+                  executor.shutdown()
+                  super.onDestroy()
+              }
+          }
+          __EOF__
+          mkdir -p "$(dirname 'app/src/main/java/com/yuduki/faceauth/MainActivity.kt')"
+          cat > 'app/src/main/java/com/yuduki/faceauth/MainActivity.kt' <<'__EOF__'
+          package com.yuduki.faceauth
+
+          import android.Manifest
+          import android.app.AlertDialog
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.graphics.Color
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.text.InputType
+          import android.view.Gravity
+          import android.view.ViewGroup
+          import android.widget.Button
+          import android.widget.CheckBox
+          import android.widget.EditText
+          import android.widget.LinearLayout
+          import android.widget.TextView
+          import androidx.activity.ComponentActivity
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.camera.core.CameraSelector
+          import androidx.camera.core.ImageAnalysis
+          import androidx.camera.core.Preview
+          import androidx.camera.lifecycle.ProcessCameraProvider
+          import androidx.camera.view.PreviewView
+          import androidx.core.content.ContextCompat
+          import com.google.mlkit.vision.common.InputImage
+          import com.google.mlkit.vision.facemesh.FaceMesh
+          import com.google.mlkit.vision.facemesh.FaceMeshDetection
+          import java.util.concurrent.Executors
+
+          class MainActivity : ComponentActivity() {
+
+              private enum class Mode { IDLE, ENROLL, AUTH }
+
+              private lateinit var previewView: PreviewView
+              private lateinit var status: TextView
+              private lateinit var pinInput: EditText
+              private lateinit var enterCheck: CheckBox
+
+              @Volatile private var mode = Mode.IDLE
+              private val samples = mutableListOf<FloatArray>()
+              private var okCount = 0
+
+              private val detector = FaceMeshDetection.getClient()
+              private val executor = Executors.newSingleThreadExecutor()
+
+              private val needSamples = 15
+
+              private val permLauncher =
+                  registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
+                      if (cameraGranted()) startCamera() else status.text = "カメラの許可が必要です"
+                  }
+
+              private fun cameraGranted() =
+                  ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) ==
+                      PackageManager.PERMISSION_GRANTED
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  buildUi()
+                  val perms = mutableListOf(Manifest.permission.CAMERA)
+                  if (Build.VERSION.SDK_INT >= 33) perms.add(Manifest.permission.POST_NOTIFICATIONS)
+                  if (cameraGranted()) startCamera()
+                  permLauncher.launch(perms.toTypedArray())
+              }
+
+              private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+
+              private fun newRow() = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+
+              private fun btn(row: LinearLayout, label: String, onClick: () -> Unit) {
+                  row.addView(
+                      Button(this).apply {
+                          text = label
+                          textSize = 13f
+                          setOnClickListener { onClick() }
+                      },
+                      LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                  )
+              }
+
+              private fun buildUi() {
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setBackgroundColor(Color.BLACK)
+                  }
+                  previewView = PreviewView(this).apply { scaleType = PreviewView.ScaleType.FIT_CENTER }
+                  root.addView(previewView, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+
+                  status = TextView(this).apply {
+                      text = "①顔を登録 ②PINかパターンを保存 ③設定を許可 ④サービスON の順に進めてください"
+                      setTextColor(Color.WHITE)
+                      textSize = 14f
+                      gravity = Gravity.CENTER
+                      setPadding(dp(12), dp(8), dp(12), dp(8))
+                  }
+                  root.addView(status)
+
+                  val r1 = newRow()
+                  btn(r1, "顔を登録") {
+                      samples.clear()
+                      mode = Mode.ENROLL
+                      status.text = "正面を向いてください…"
+                  }
+                  btn(r1, "認証テスト") {
+                      if (Store.loadFace(this) == null) {
+                          status.text = "先に顔を登録してください"
+                      } else {
+                          okCount = 0
+                          mode = Mode.AUTH
+                          status.text = "認証中…"
+                      }
+                  }
+                  btn(r1, "停止") {
+                      mode = Mode.IDLE
+                      status.text = "停止しました"
+                  }
+                  root.addView(r1)
+
+                  val pinRow = newRow()
+                  pinInput = EditText(this).apply {
+                      hint = if (Store.hasPin(this@MainActivity)) "PIN(保存済み・変更する場合のみ入力)"
+                      else "ロック解除のPIN(空ならスワイプのみ)"
+                      setHintTextColor(Color.GRAY)
+                      setTextColor(Color.WHITE)
+                      textSize = 14f
+                      inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_VARIATION_PASSWORD
+                  }
+                  pinRow.addView(pinInput, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+                  enterCheck = CheckBox(this).apply {
+                      text = "最後にEnter"
+                      setTextColor(Color.WHITE)
+                      isChecked = Store.getEnter(this@MainActivity)
+                  }
+                  pinRow.addView(enterCheck)
+                  root.addView(pinRow)
+
+                  val r2 = newRow()
+                  btn(r2, "PINを保存") {
+                      Store.savePin(this, pinInput.text.toString())
+                      Store.setEnter(this, enterCheck.isChecked)
+                      pinInput.setText("")
+                      status.text = "ロック解除の操作を保存しました"
+                  }
+                  btn(r2, "サービスON") {
+                      if (Store.loadFace(this) == null) {
+                          status.text = "先に顔を登録してください"
+                      } else {
+                          ContextCompat.startForegroundService(this, Intent(this, FaceService::class.java))
+                          status.text = if (UnlockService.instance == null)
+                              "ONにしました。アクセシビリティの許可がまだです"
+                          else "ONにしました。画面を消して試してください"
+                      }
+                  }
+                  btn(r2, "サービスOFF") {
+                      stopService(Intent(this, FaceService::class.java))
+                      status.text = "OFFにしました"
+                  }
+                  root.addView(r2)
+
+                  val r3 = newRow()
+                  btn(r3, "パターン登録") { showPatternDialog() }
+                  btn(r3, "アクセシビリティ設定") {
+                      startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+                  }
+                  btn(r3, "アプリ情報") {
+                      startActivity(
+                          Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:$packageName"))
+                      )
+                  }
+                  root.addView(r3)
+
+                  setContentView(root)
+              }
+
+              private fun showPatternDialog() {
+                  val pv = PatternInputView(this)
+                  val box = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(dp(16), dp(16), dp(16), 0)
+                  }
+                  box.addView(pv, LinearLayout.LayoutParams(dp(260), dp(260)).apply {
+                      gravity = Gravity.CENTER_HORIZONTAL
+                  })
+                  val dlg = AlertDialog.Builder(this)
+                      .setTitle("ロック画面と同じパターンを描いてください")
+                      .setView(box)
+                      .setPositiveButton("保存") { _, _ ->
+                          val p = pv.pattern()
+                          if (p.length < 4) {
+                              status.text = "パターンは4点以上つないでください"
+                          } else {
+                              Store.savePattern(this, p)
+                              status.text = "パターンを保存しました"
+                          }
+                      }
+                      .setNeutralButton("やり直し", null)
+                      .setNegativeButton("キャンセル", null)
+                      .create()
+                  dlg.show()
+                  dlg.getButton(AlertDialog.BUTTON_NEUTRAL).setOnClickListener { pv.clear() }
+              }
+
+              private fun startCamera() {
+                  val future = ProcessCameraProvider.getInstance(this)
+                  future.addListener({
+                      val provider = future.get()
+                      val preview = Preview.Builder().build().also {
+                          it.setSurfaceProvider(previewView.surfaceProvider)
+                      }
+                      val analysis = ImageAnalysis.Builder()
+                          .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                          .build()
+                      analysis.setAnalyzer(executor) { proxy ->
+                          val media = proxy.image
+                          if (media == null || mode == Mode.IDLE) {
+                              proxy.close()
+                              return@setAnalyzer
+                          }
+                          val input = InputImage.fromMediaImage(media, proxy.imageInfo.rotationDegrees)
+                          detector.process(input)
+                              .addOnSuccessListener { handle(it) }
+                              .addOnCompleteListener { proxy.close() }
+                      }
+                      provider.unbindAll()
+                      provider.bindToLifecycle(this, CameraSelector.DEFAULT_FRONT_CAMERA, preview, analysis)
+                  }, ContextCompat.getMainExecutor(this))
+              }
+
+              private fun handle(meshes: List<FaceMesh>) {
+                  if (mode == Mode.IDLE) return
+                  if (meshes.isEmpty()) {
+                      okCount = 0
+                      status.text = "顔が見つかりません"
+                      return
+                  }
+                  val sig = FaceCore.signature(meshes[0])
+                  when (mode) {
+                      Mode.ENROLL -> {
+                          samples.add(sig)
+                          status.text = "登録中… ${samples.size}/$needSamples"
+                          if (samples.size >= needSamples) {
+                              Store.saveFace(this, FaceCore.average(samples))
+                              samples.clear()
+                              mode = Mode.IDLE
+                              status.text = "顔の登録が完了しました"
+                          }
+                      }
+                      Mode.AUTH -> {
+                          val ref = Store.loadFace(this)
+                          if (ref == null) {
+                              mode = Mode.IDLE
+                              status.text = "先に顔を登録してください"
+                              return
+                          }
+                          val d = FaceCore.dist(sig, ref)
+                          if (d < FaceCore.THRESHOLD) okCount++ else okCount = 0
+                          if (okCount >= FaceCore.NEED_OK_FRAMES) {
+                              mode = Mode.IDLE
+                              status.text = "認証成功 ✅ (スコア %.3f)".format(d)
+                          } else {
+                              status.text = "認証中… スコア %.3f(%.2f未満で成功)".format(d, FaceCore.THRESHOLD)
+                          }
+                      }
+                      else -> {}
+                  }
+              }
+
+              override fun onDestroy() {
+                  super.onDestroy()
+                  detector.close()
+                  executor.shutdown()
+              }
+          }
+          __EOF__
+          mkdir -p "$(dirname 'app/src/main/java/com/yuduki/faceauth/PatternView.kt')"
+          cat > 'app/src/main/java/com/yuduki/faceauth/PatternView.kt' <<'__EOF__'
+          package com.yuduki.faceauth
+
+          import android.content.Context
+          import android.graphics.Canvas
+          import android.graphics.Color
+          import android.graphics.Paint
+          import android.view.MotionEvent
+          import android.view.View
+          import kotlin.math.hypot
+
+          // 3x3のパターン入力ビュー。点は1〜9(左上から右へ、上から下へ)
+          class PatternInputView(ctx: Context) : View(ctx) {
+
+              private val cells = mutableListOf<Int>()
+              private val dotPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.GRAY }
+              private val onPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.rgb(0, 150, 255) }
+              private val linePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                  color = Color.rgb(0, 150, 255)
+                  strokeWidth = 10f
+                  style = Paint.Style.STROKE
+                  strokeCap = Paint.Cap.ROUND
+              }
+              private var fx = -1f
+              private var fy = -1f
+
+              private fun cx(i: Int) = (i % 3 + 0.5f) * width / 3f
+              private fun cy(i: Int) = (i / 3 + 0.5f) * height / 3f
+
+              fun pattern(): String = cells.joinToString("") { (it + 1).toString() }
+
+              fun clear() {
+                  cells.clear()
+                  fx = -1f
+                  invalidate()
+              }
+
+              override fun onTouchEvent(e: MotionEvent): Boolean {
+                  when (e.actionMasked) {
+                      MotionEvent.ACTION_DOWN -> {
+                          cells.clear()
+                          hit(e.x, e.y)
+                          fx = e.x; fy = e.y
+                      }
+                      MotionEvent.ACTION_MOVE -> {
+                          hit(e.x, e.y)
+                          fx = e.x; fy = e.y
+                      }
+                      MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> fx = -1f
+                  }
+                  invalidate()
+                  return true
+              }
+
+              private fun hit(x: Float, y: Float) {
+                  val r = width / 3f * 0.35f
+                  for (i in 0..8) {
+                      if (i !in cells && hypot(x - cx(i), y - cy(i)) < r) {
+                          add(i)
+                          break
+                      }
+                  }
+              }
+
+              // 飛び越した中間の点も自動で追加(Android本体の挙動と同じ)
+              private fun add(i: Int) {
+                  if (cells.isNotEmpty()) {
+                      val l = cells.last()
+                      val dr = i / 3 - l / 3
+                      val dc = i % 3 - l % 3
+                      if (dr % 2 == 0 && dc % 2 == 0 && (dr != 0 || dc != 0)) {
+                          val m = ((l / 3 + i / 3) / 2) * 3 + (l % 3 + i % 3) / 2
+                          if (m !in cells) cells.add(m)
+                      }
+                  }
+                  cells.add(i)
+              }
+
+              override fun onDraw(canvas: Canvas) {
+                  for (k in 1 until cells.size) {
+                      canvas.drawLine(cx(cells[k - 1]), cy(cells[k - 1]), cx(cells[k]), cy(cells[k]), linePaint)
+                  }
+                  if (cells.isNotEmpty() && fx >= 0f) {
+                      canvas.drawLine(cx(cells.last()), cy(cells.last()), fx, fy, linePaint)
+                  }
+                  for (i in 0..8) {
+                      canvas.drawCircle(cx(i), cy(i), width / 3f * if (i in cells) 0.12f else 0.08f,
+                          if (i in cells) onPaint else dotPaint)
+                  }
+              }
+          }
+          __EOF__
+          mkdir -p "$(dirname 'app/src/main/java/com/yuduki/faceauth/UnlockService.kt')"
+          cat > 'app/src/main/java/com/yuduki/faceauth/UnlockService.kt' <<'__EOF__'
+          package com.yuduki.faceauth
+
+          import android.accessibilityservice.AccessibilityService
+          import android.accessibilityservice.GestureDescription
+          import android.content.Intent
+          import android.graphics.Path
+          import android.graphics.Rect
+          import android.os.Handler
+          import android.os.Looper
+          import android.view.accessibility.AccessibilityEvent
+          import android.view.accessibility.AccessibilityNodeInfo
+
+          // 顔認証成功時に「上スワイプ → PIN入力 → (Enter)」を再生するサービス
+          class UnlockService : AccessibilityService() {
+
+              companion object {
+                  @Volatile var instance: UnlockService? = null
+                  private const val SYSTEM_UI = "com.android.systemui"
+              }
+
+              private val h = Handler(Looper.getMainLooper())
+
+              override fun onServiceConnected() { instance = this }
+
+              override fun onUnbind(intent: Intent?): Boolean {
+                  instance = null
+                  return super.onUnbind(intent)
+              }
+
+              override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
+              override fun onInterrupt() {}
+
+              fun unlock(mode: String, secret: String?, pressEnter: Boolean) {
+                  val dm = resources.displayMetrics
+                  swipeUp(dm.widthPixels.toFloat(), dm.heightPixels.toFloat())
+                  if (secret.isNullOrEmpty()) return
+                  if (mode == "pattern") h.postDelayed({ drawPattern(secret, 15) }, 600)
+                  else h.postDelayed({ typeFrom(secret, 0, pressEnter, 12) }, 500)
+              }
+
+              // ロック画面のパターンビューを探し、その枠から3x3の各点の座標を計算してなぞる
+              private fun drawPattern(p: String, tries: Int) {
+                  val node = findInRoots { n ->
+                      n.packageName == SYSTEM_UI && (
+                          n.viewIdResourceName?.endsWith("lockPatternView") == true ||
+                              n.className?.toString()?.endsWith("LockPatternView") == true
+                          )
+                  }
+                  if (node == null) {
+                      if (tries > 0) h.postDelayed({ drawPattern(p, tries - 1) }, 200)
+                      return
+                  }
+                  val r = Rect()
+                  node.getBoundsInScreen(r)
+                  val cw = r.width() / 3f
+                  val ch = r.height() / 3f
+                  val path = Path()
+                  p.forEachIndexed { i, c ->
+                      val cell = c - '1'
+                      if (cell !in 0..8) return
+                      val x = r.left + (cell % 3 + 0.5f) * cw
+                      val y = r.top + (cell / 3 + 0.5f) * ch
+                      if (i == 0) path.moveTo(x, y) else path.lineTo(x, y)
+                  }
+                  gesture(path, 150L * p.length)
+              }
+
+              private fun swipeUp(w: Float, hgt: Float) {
+                  val path = Path().apply {
+                      moveTo(w / 2, hgt * 0.85f)
+                      lineTo(w / 2, hgt * 0.2f)
+                  }
+                  gesture(path, 300)
+              }
+
+              private fun tap(x: Float, y: Float) {
+                  gesture(Path().apply { moveTo(x, y) }, 50)
+              }
+
+              private fun gesture(path: Path, duration: Long) {
+                  val g = GestureDescription.Builder()
+                      .addStroke(GestureDescription.StrokeDescription(path, 0, duration))
+                      .build()
+                  dispatchGesture(g, null, null)
+              }
+
+              // 1桁ずつ探して押す。キーパッドが出るまで最大約2.4秒リトライ
+              private fun typeFrom(pin: String, i: Int, pressEnter: Boolean, tries: Int) {
+                  if (i >= pin.length) {
+                      if (pressEnter) h.postDelayed({ pressEnter() }, 150)
+                      return
+                  }
+                  val d = pin[i].toString()
+                  val node = findInRoots { n ->
+                      n.packageName == SYSTEM_UI &&
+                          (n.text?.toString() == d || n.contentDescription?.toString() == d)
+                  }
+                  if (node == null) {
+                      if (tries > 0) h.postDelayed({ typeFrom(pin, i, pressEnter, tries - 1) }, 200)
+                      return
+                  }
+                  click(node)
+                  h.postDelayed({ typeFrom(pin, i + 1, pressEnter, 10) }, 130)
+              }
+
+              private fun pressEnter() {
+                  val node = findInRoots { n ->
+                      n.packageName == SYSTEM_UI && (
+                          n.viewIdResourceName?.endsWith("key_enter") == true ||
+                              n.contentDescription?.toString() in listOf("Enter", "エンター")
+                          )
+                  } ?: return
+                  click(node)
+              }
+
+              private fun click(n: AccessibilityNodeInfo) {
+                  var c: AccessibilityNodeInfo? = n
+                  while (c != null && !c.isClickable) c = c.parent
+                  if (c != null && c.performAction(AccessibilityNodeInfo.ACTION_CLICK)) return
+                  val r = Rect()
+                  n.getBoundsInScreen(r)
+                  tap(r.exactCenterX(), r.exactCenterY())
+              }
+
+              private fun findInRoots(pred: (AccessibilityNodeInfo) -> Boolean): AccessibilityNodeInfo? {
+                  val roots = windows.mapNotNull { it.root } + listOfNotNull(rootInActiveWindow)
+                  for (r in roots) find(r, pred)?.let { return it }
+                  return null
+              }
+
+              private fun find(n: AccessibilityNodeInfo?, pred: (AccessibilityNodeInfo) -> Boolean): AccessibilityNodeInfo? {
+                  if (n == null) return null
+                  if (pred(n)) return n
+                  for (i in 0 until n.childCount) find(n.getChild(i), pred)?.let { return it }
+                  return null
+              }
+          }
+          __EOF__
+          mkdir -p "$(dirname 'app/src/main/res/values/strings.xml')"
+          cat > 'app/src/main/res/values/strings.xml' <<'__EOF__'
+          <resources>
+              <string name="a11y_desc">顔認証に成功したときに、ロック画面でスワイプとPIN入力を自動で行います。</string>
+          </resources>
+          __EOF__
+          mkdir -p "$(dirname 'app/src/main/res/xml/accessibility_config.xml')"
+          cat > 'app/src/main/res/xml/accessibility_config.xml' <<'__EOF__'
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityEventTypes="typeWindowStateChanged"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:accessibilityFlags="flagRetrieveInteractiveWindows|flagReportViewIds|flagIncludeNotImportantViews"
+              android:canPerformGestures="true"
+              android:canRetrieveWindowContent="true"
+              android:description="@string/a11y_desc"
+              android:notificationTimeout="100" />
+          __EOF__
+          mkdir -p "$(dirname 'build.gradle.kts')"
+          cat > 'build.gradle.kts' <<'__EOF__'
+          plugins {
+              id("com.android.application") version "8.5.0" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          __EOF__
+          mkdir -p "$(dirname 'gradle.properties')"
+          cat > 'gradle.properties' <<'__EOF__'
+          org.gradle.jvmargs=-Xmx2g
+          android.useAndroidX=true
+          kotlin.code.style=official
+          __EOF__
+          mkdir -p "$(dirname 'settings.gradle.kts')"
+          cat > 'settings.gradle.kts' <<'__EOF__'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "FaceAuth"
+          include(":app")
+          __EOF__
+      - name: Build
+        run: gradle assembleDebug --no-daemon --stacktrace
+      - uses: actions/upload-artifact@v4
+        with:
+          name: face_auth_v4_apk
+          path: app/build/outputs/apk/debug/app-debug.apk
